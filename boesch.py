@@ -117,7 +117,6 @@ class BoeschWP:
                     print("error: ", e)
 
     def switch(self, datapoint, onOff):
-        print(datapoint,onOff, type(onOff))
         headers = {
             'Cookie': self.cookies_cookie,
             'Content-Type': 'application/json;charset=UTF-8'
@@ -141,9 +140,6 @@ class BoeschWP:
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
 
-
-import argparse
-
 def main():
 
     wp = BoeschWP()
@@ -153,7 +149,6 @@ def main():
     subparsers = parser.add_subparsers(dest='subcommand', required=True)
 
     switch_parser = subparsers.add_parser('switch', help="Switch device on or off")
-    print(wp.config["switchDatapoints"])
     device_help = {device: f"Device: {device} ({info['description']})" for device, info in wp.config["switchDatapoints"].items()}
 
     device_choices = list(wp.config["switchDatapoints"].keys())
