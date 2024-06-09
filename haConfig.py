@@ -1,14 +1,21 @@
+mqtt = {
+    "broker": "mqtt.broker.com",
+    "port": 1883,
+    "user": "mqtt-user",
+    "password": "mqtt-password",
+    "topic": "topic/#"
+}
 boesch = {
-    "user" : "xxxxxxxxx",
-    "pass" : "xxxxxxxxx",
+    "user" : "boesch/kermi-webportal-user",
+    "pass" : "boesch/kermi-webportal-password",
     "portal" : "https://portal.kermi.com", 
     "portal_DE" : "https://portal.kermi.com/xcenterpro/de-DE/",
     "openid_url" : "https://portal.kermi.com/openid",
     "portal_url" : "https://portal.kermi.com/xcenterpro",
-    "home_server_id" : "xxxxxxxxxx",
+    "home_server_id" : "HomeServerId",
     "read_value_url" : "https://portal.kermi.com/xcenterpro/api/Datapoint/ReadValues/",
     "write_value_url" : "https://portal.kermi.com/xcenterpro/api/Datapoint/WriteValues/",
-    "device_id" : "xxxxxxxxx",
+    "device_id" : "DeviceId",
     "monitorDatapoints" : {
         "83a34595-924a-421e-b9c1-44c2a49f97ad" : {
             "description" : "Trinkwassertemperatur",
