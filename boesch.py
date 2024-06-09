@@ -1,5 +1,3 @@
-import os
-import sys
 import json
 import re
 import requests
@@ -10,20 +8,18 @@ import argparse
 from urllib.parse import urlparse
 from urllib.parse import parse_qs
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import haConfig
-
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 
 class BoeschWP:
     def __init__(self):
-        config = haConfig.getConfig()
-        self.config = config['boesch']
-        self.mqtt_config = config['mqtt']
+        with open('haConfig.json', 'r') as file:
+            haConfig = json.load(file)
+        self.config = haConfig["boesch"]
+        self.mqtt_config = haConfig["mqtt"]
 
     def publish_mqtt(self, topic, value):
-        mqtt_client = mqtt.Client()
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         mqtt_client.username_pw_set(self.mqtt_config['user'], self.mqtt_config['password'])
         mqtt_client.connect(self.mqtt_config['broker'], self.mqtt_config['port'], 60)
         mqtt_client.publish(topic, value)
@@ -87,7 +83,6 @@ class BoeschWP:
         payload = {
             "DatapointValues": [{"DatapointConfigId": key, "DeviceId": self.config["device_id"]} for key in self.config["monitorDatapoints"].keys()]
         }
-        
         response = requests.post(self.config["read_value_url"] + self.config["home_server_id"], data=json.dumps(payload), headers=headers, verify=False)
         data_points = json.loads(response.text)['ResponseData']
         try:
