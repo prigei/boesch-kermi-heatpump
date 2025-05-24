@@ -55,6 +55,7 @@ class BoeschWP:
         return state, code_verifier, code_challenge
 
     def get_login_csrf_token(self, session, state, code_challenge):
+        print(self.config)
         return_url_params = {
             "client_id": self.config["client_id"],
             "redirect_uri": self.config["redirect_uri"],

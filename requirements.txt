@@ -1,0 +1,4 @@
+requests
+boto3
+beautifulsoup4
+paho-mqtt 
