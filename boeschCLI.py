@@ -1,18 +1,13 @@
-import json
-import re
 import requests
-import boto3
-import secrets
-import base64
 import hashlib
-from bs4 import BeautifulSoup
-import paho.mqtt.client as mqtt
-import warnings
-from urllib.parse import urlparse, parse_qs
-import urllib
+import base64
+import secrets
+import urllib.parse
+import re
+import json
 import argparse
-
-warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+import boto3
+from typing import Dict, Optional
 
 def getConfig(home, jsonKeys):
     lambda_client = boto3.client('lambda')
@@ -30,215 +25,173 @@ def getConfig(home, jsonKeys):
 
 def publish_to_mqtt(mqtt_config, topic, value):
     try:
+        import paho.mqtt.client as mqtt
         mqtt_client = mqtt.Client()
-        mqtt_client.username_pw_set(mqtt_config['user'], mqtt_config['password'])
+        if mqtt_config.get('user') and mqtt_config.get('password'):
+            mqtt_client.username_pw_set(mqtt_config['user'], mqtt_config['password'])
         mqtt_client.connect(mqtt_config['broker'], int(mqtt_config['port']), 60)
         mqtt_client.publish(topic, value)
         mqtt_client.disconnect()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Could not publish to MQTT: {e}")
 
 class BoeschWP:
     def __init__(self, home, jsonKeys):
         config_str = getConfig(home, jsonKeys)
         config = json.loads(config_str)
         self.config = config['boesch']
-        self.mqtt_config = config['mqtt']
+        self.mqtt_config = config.get('mqtt', {})
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+        })
         self.access_token = None
 
-    def generate_pkce_and_state(self):
-        state = secrets.token_urlsafe(32)
-        code_verifier = secrets.token_urlsafe(64)
-        code_challenge = base64.urlsafe_b64encode(
-            hashlib.sha256(code_verifier.encode()).digest()
-        ).rstrip(b"=").decode("ascii")
-        return state, code_verifier, code_challenge
+    def login(self):
+        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(96)).decode('utf-8').rstrip('=')
+        challenge = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+        code_challenge = base64.urlsafe_b64encode(challenge).decode('utf-8').rstrip('=')
+        state = secrets.token_hex(16)
 
-    def get_login_csrf_token(self, session, state, code_challenge):
-        print(self.config)
-        return_url_params = {
-            "client_id": self.config["client_id"],
-            "redirect_uri": self.config["redirect_uri"],
-            "response_type": "code",
-            "scope": self.config["scope"],
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "ui_locales": self.config.get("ui_locales", "en-DE")
+        auth_params = {
+            'client_id': self.config["client_id"],
+            'redirect_uri': self.config["redirect_uri"],
+            'response_type': 'code',
+            'scope': self.config["scope"],
+            'state': state,
+            'code_challenge': code_challenge,
+            'code_challenge_method': 'S256',
         }
-        encoded_return_url = urllib.parse.quote(
-            f"/openid/connect/authorize?{urllib.parse.urlencode(return_url_params)}"
-        )
-        login_url_with_return = f'{self.config["openid_url"]}/Account/Login?ReturnUrl={encoded_return_url}'
         
-        resp = session.get(login_url_with_return, verify=False)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        token_input = soup.find("input", {"name": "__RequestVerificationToken"})
-        csrf_token = token_input.get("value") if token_input else None
-        return csrf_token, encoded_return_url
-    
-    def submit_login_credentials(self, session, csrf_token, encoded_return_url):
-        form_data = {
-            "Login": self.config["user"],
-            "Password": self.config["pass"],
-            "__RequestVerificationToken": csrf_token
-        }
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        actual_post_url_for_login = f'{self.config["openid_url"]}/Account/Login?ReturnUrl={encoded_return_url}' 
-        login_response = session.post(
-            actual_post_url_for_login, data=form_data, headers=headers, allow_redirects=True, verify=False
-        )
-        return login_response
+        auth_url = f"{self.config['portal']}/openid/connect/authorize"
+        response = self.session.get(auth_url, params=auth_params, allow_redirects=True)
+        response.raise_for_status()
 
-    def exchange_code_for_tokens(self, session, login_response_url, initial_state, code_verifier):
-        parsed_callback_url = urllib.parse.urlparse(login_response_url)
-        query_params_callback = urllib.parse.parse_qs(parsed_callback_url.query)
-        code = query_params_callback.get("code", [None])[0]
-        token_endpoint_url = f'{self.config["portal"]}{self.config.get("token_endpoint_path", "/openid/connect/token")}' 
-        token_exchange_payload = {
+        match = re.search(r'name="__RequestVerificationToken".*?value="([^"]+)"', response.text)
+        if not match:
+            raise ValueError("Failed to extract form verification token")
+        form_token = match.group(1)
+
+        login_data = {
+            'Login': self.config["user"],
+            'Password': self.config["pass"],
+            'login': '',
+            '__RequestVerificationToken': form_token
+        }
+
+        return_url_match = re.search(r'action="([^"]+)"', response.text)
+        if not return_url_match:
+            raise ValueError("Could not find login post URL")
+        
+        login_post_url = f"{self.config['portal']}{return_url_match.group(1)}"
+        
+        response = self.session.post(
+            login_post_url, data=login_data, 
+            headers={'Content-Type': 'application/x-www-form-urlencoded', 'Origin': self.config['portal'], 'Referer': response.url},
+            allow_redirects=False
+        )
+
+        auth_code = None
+        while response.status_code in [302, 301]:
+            location = response.headers.get('Location')
+            if not location: break
+            if 'code=' in location:
+                parsed_url = urllib.parse.urlparse(location)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                auth_code = query_params.get('code', [None])[0]
+                break
+            
+            next_url = urllib.parse.urljoin(self.config['portal'], location)
+            response = self.session.get(next_url, allow_redirects=False)
+
+        if not auth_code:
+            raise ValueError("Failed to get authorization code")
+
+        token_data = {
             'grant_type': 'authorization_code',
             'redirect_uri': self.config["redirect_uri"],
-            'code': code,
+            'code': auth_code,
             'code_verifier': code_verifier,
             'client_id': self.config["client_id"]
         }
-        token_request_headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json"
-        }
-        token_response = session.post(
-            token_endpoint_url, data=token_exchange_payload, headers=token_request_headers,
-            allow_redirects=False, verify=False
-        )
-        return token_response.json().get("access_token")
+        token_url = f"{self.config['portal']}/openid/connect/token"
+        token_response = self.session.post(token_url, data=token_data)
+        token_response.raise_for_status()
         
-    def perform_pkce_login_and_get_token(self, session):
-        initial_state, verifier, challenge = self.generate_pkce_and_state()
-        csrf, final_encoded_return_url = self.get_login_csrf_token(session, initial_state, challenge)
-        if not csrf:
-            print("Error: Failed to get CSRF token during login.")
-            return None
-        login_resp = self.submit_login_credentials(session, csrf, final_encoded_return_url)
-        if not login_resp or not login_resp.url or "code=" not in login_resp.url:
-             print("Error: Login submission failed or did not return a code.")
-             return None
-        access_token = self.exchange_code_for_tokens(session, login_resp.url, initial_state, verifier)
-        return access_token
-        
+        tokens = token_response.json()
+        self.access_token = tokens['access_token']
+        return self.access_token
+
     def _validate_datapoint_config(self, datapoint_name):
-        if "setDatapoints" not in self.config:
-            raise ValueError("'setDatapoints' configuration not found in 'boesch' config.")
-        if datapoint_name not in self.config["setDatapoints"]:
+        datapoint_config = self.config.get("setDatapoints", {}).get(datapoint_name)
+        if not datapoint_config:
             raise ValueError(f"{datapoint_name} datapoint configuration not found")
-        datapoint_config = self.config["setDatapoints"][datapoint_name]
-        required_keys = ["datapoint", "unit", "values", "dpType"]
-        missing_keys = [key for key in required_keys if key not in datapoint_config]
-        if missing_keys:
-            raise ValueError(f"Missing required keys in {datapoint_name} configuration: {', '.join(missing_keys)}")
-        if not isinstance(datapoint_config["values"], list) or len(datapoint_config["values"]) < 2:
-            raise ValueError(f"{datapoint_name} configuration must have a 'values' array with at least 2 elements")
         return datapoint_config
 
-    def get_datapoint(self, session, access_token, datapoint_name):
+    def get_datapoint(self, datapoint_name):
         datapoint_config = self._validate_datapoint_config(datapoint_name)
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Accept": "application/json"
-            }
-        datapoint_id = datapoint_config["datapoint"]
-        dpType = datapoint_config["dpType"]
-        payload = {"DatapointValues":
-                    [{"$type":dpType,
-                        "Value": 0,
-                        "DatapointConfigId":datapoint_id,
-                        "DeviceId":self.config["device_id"],"Flags":0}
-                    ]}
-        response = requests.post(self.config["read_value_url"] + self.config["home_server_id"], 
-                                    data=json.dumps(payload), headers=headers, verify=False)
+        payload = {"DatapointValues": [{
+            "$type": datapoint_config["dpType"], "Value": 0,
+            "DatapointConfigId": datapoint_config["datapoint"],
+            "DeviceId": self.config["device_id"], "Flags": 0
+        }]}
+        response = self.session.post(
+            f'{self.config["read_value_url"]}{self.config["home_server_id"]}',
+            json=payload, headers={"Authorization": f"Bearer {self.access_token}"}
+        )
         response.raise_for_status()
         data_points = response.json()['ResponseData']
-        datapoint_value_item = next((item for item in data_points if item["DatapointConfigId"] == datapoint_id), None)
-        if datapoint_value_item is None or 'Value' not in datapoint_value_item:
-            raise ValueError(f"{datapoint_name} (ID: {datapoint_id}) not found in API response or 'Value' key is missing.")
-        value = round(float(datapoint_value_item['Value']), 2)
-        return value
-    
-    def set_datapoint(self, session, access_token, datapoint_name, value_to_set):
-        datapoint_config = self._validate_datapoint_config(datapoint_name)
-        values_cfg = datapoint_config["values"]
-        if len(values_cfg) == 2 and isinstance(values_cfg[0], (int,float)) and isinstance(values_cfg[1], (int,float)) and values_cfg[0] < values_cfg[1]:
-            min_value, max_value = values_cfg
-            if not (min_value <= float(value_to_set) <= max_value):
-                raise ValueError(f"{datapoint_name} value {value_to_set} must be between {min_value} and {max_value}")
-        elif float(value_to_set) not in [float(v) for v in values_cfg]:
-                raise ValueError(f"{datapoint_name} value {value_to_set} must be one of: {values_cfg}")
+        dp_item = next((item for item in data_points if item["DatapointConfigId"] == datapoint_config["datapoint"]), None)
+        if dp_item is None or 'Value' not in dp_item:
+            raise ValueError(f"{datapoint_name} not found in API response")
+        return round(float(dp_item['Value']), 2)
 
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Accept": "application/json"
-            }
-        datapoint_id = datapoint_config["datapoint"]
-        dpType = datapoint_config["dpType"]
-        
+    def set_datapoint(self, datapoint_name, value_to_set):
+        datapoint_config = self._validate_datapoint_config(datapoint_name)
         raw_value = value_to_set
-        if "Int32" in dpType:
-            raw_value = int(value_to_set)
-        elif "Single" in dpType or "Double" in dpType:
-            raw_value = float(value_to_set)
+        if "Int32" in datapoint_config["dpType"]: raw_value = int(value_to_set)
+        elif "Single" in datapoint_config["dpType"] or "Double" in datapoint_config["dpType"]: raw_value = float(value_to_set)
         
-        payload = {"DatapointValues":
-                    [{"$type": dpType,
-                        "Value": raw_value,
-                        "DatapointConfigId": datapoint_id,
-                        "DeviceId": self.config["device_id"], "Flags": 0}
-                    ]}
-        response = requests.post(self.config["write_value_url"] + self.config["home_server_id"], 
-                                    data=json.dumps(payload), headers=headers, verify=False)
+        payload = {"DatapointValues": [{
+            "$type": datapoint_config["dpType"], "Value": raw_value,
+            "DatapointConfigId": datapoint_config["datapoint"],
+            "DeviceId": self.config["device_id"], "Flags": 0
+        }]}
+        response = self.session.post(
+            f'{self.config["write_value_url"]}{self.config["home_server_id"]}',
+            json=payload, headers={"Authorization": f"Bearer {self.access_token}"}
+        )
         response.raise_for_status()
         if response.json().get('StatusCode') == 1:
-            raise ValueError(f"API error setting {datapoint_name} value: {response.json().get('StatusText', 'Unknown API error')}")
+            raise ValueError(f"API error: {response.json().get('StatusText', 'Unknown')}")
         return True
-    
-    def _read_datapoints_from_api(self, session, access_token, datapoints_config_key, datapoints_group_name):
-        if datapoints_config_key not in self.config or not isinstance(self.config[datapoints_config_key], dict):
-            print(f"Warning: '{datapoints_config_key}' is missing or not a dictionary in configuration. Skipping API call for {datapoints_group_name}.")
-            return {}
-        specific_datapoints = self.config[datapoints_config_key]
-        if not specific_datapoints:
-            print(f"Warning: '{datapoints_config_key}' is empty. No datapoints to read for {datapoints_group_name}.")
-            return {}
 
-        read_values_url = f'{self.config["read_value_url"]}{self.config["home_server_id"]}'
+    def _read_datapoints_from_api(self, datapoints_key):
+        datapoints_config = self.config.get(datapoints_key, {})
+        if not datapoints_config: return {}
+        
         datapoints_to_read = [
             {"DatapointConfigId": dp_id, "DeviceId": self.config["device_id"]}
-            for dp_id in specific_datapoints.keys()
+            for dp_id in datapoints_config.keys()
         ]
-        
-        if not datapoints_to_read:
-            return {}
-                
-        read_payload = {"DatapointValues": datapoints_to_read}
-        api_headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Accept": "application/json"
-        }
-        api_response = session.post(read_values_url, json=read_payload, headers=api_headers, verify=False)
-        api_response.raise_for_status()
-        return api_response.json()
+        if not datapoints_to_read: return {}
 
-    def monitor(self, session, access_token):
-        api_response_data = self._read_datapoints_from_api(session, access_token, "monitorDatapoints", "monitor")
+        read_payload = {"DatapointValues": datapoints_to_read}
+        response = self.session.post(
+            f'{self.config["read_value_url"]}{self.config["home_server_id"]}',
+            json=read_payload, headers={"Authorization": f"Bearer {self.access_token}"}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def monitor(self):
+        api_response_data = self._read_datapoints_from_api("monitorDatapoints")
         returned_datapoints = api_response_data.get('ResponseData', [])
-        results = {}
         print("--- Monitored Datapoints ---")
         for dp_data in returned_datapoints:
             dp_id = dp_data.get('DatapointConfigId')
             raw_value = dp_data.get('Value')
             if dp_id and raw_value is not None:
-                results[dp_id] = raw_value
                 dp_detail_config = self.config["monitorDatapoints"].get(dp_id, {})
                 desc = dp_detail_config.get('description', 'N/A')
                 unit = dp_detail_config.get('unit', '')
@@ -246,45 +199,31 @@ class BoeschWP:
                 actual_value = round(float(raw_value) * factor, 2)
                 print(f"  {desc} ({dp_id}): {actual_value} {unit}")
                 
-                dp_mqtt_config = self.config["monitorDatapoints"].get(dp_id)
-                if dp_mqtt_config and all(k in dp_mqtt_config for k in ['device', 'type', 'unit', 'factor']):
-                    mqtt_device, mqtt_type, mqtt_unit = [
-                        dp_mqtt_config['device'], 
-                        dp_mqtt_config['type'], 
-                        dp_mqtt_config['unit']
-                    ]
-                    topic = f"sensors/{mqtt_type}/WP/TR/{mqtt_device}/{mqtt_unit}"
-                    publish_to_mqtt(self.mqtt_config, topic, actual_value)
-        if not results:
-            print("No data returned or processed for monitor.")
-        return results
+                if self.mqtt_config:
+                    mqtt_cfg = dp_detail_config
+                    if all(k in mqtt_cfg for k in ['device', 'type', 'unit']):
+                        topic = f"sensors/{mqtt_cfg['type']}/WP/TR/{mqtt_cfg['device']}/{mqtt_cfg['unit']}"
+                        publish_to_mqtt(self.mqtt_config, topic, actual_value)
 
-    def status(self, session, access_token):
-        api_response_data = self._read_datapoints_from_api(session, access_token, "statusDatapoints", "status")
+    def status(self):
+        api_response_data = self._read_datapoints_from_api("statusDatapoints")
         returned_datapoints = api_response_data.get('ResponseData', [])
-        results = {}
         print("--- Status Datapoints ---")
         for dp_data in returned_datapoints:
             dp_id = dp_data.get('DatapointConfigId')
             raw_value = dp_data.get('Value')
             if dp_id and raw_value is not None:
-                results[dp_id] = raw_value
                 dp_detail_config = self.config["statusDatapoints"].get(dp_id, {})
                 desc = dp_detail_config.get('description', 'N/A')
                 print(f"  {desc} ({dp_id}): {raw_value}")
-        if not results:
-            print("No data returned or processed for status.")
-        return results
-            
+
 def main_cli():
     parser = argparse.ArgumentParser(description="Boesch Heatpump CLI Tool")
-    parser.add_argument("home_id", help="Your Home ID (e.g., prg)")
-    
+    parser.add_argument("home_id", help="Your Home ID (e.g., prg), used for config selection if applicable.")
     subparsers = parser.add_subparsers(dest="command", title="commands", required=True)
     
-    monitor_parser = subparsers.add_parser("monitor", help="Fetch and display monitor datapoints.")
-    
-    status_parser = subparsers.add_parser("status", help="Fetch and display status datapoints.")
+    subparsers.add_parser("monitor", help="Fetch and display monitor datapoints.")
+    subparsers.add_parser("status", help="Fetch and display status datapoints.")
     
     dp_parser = subparsers.add_parser("datapoint", help="Get or set a specific datapoint.")
     dp_parser.add_argument("action", choices=["get", "set"], help="Action to perform on the datapoint.")
@@ -293,56 +232,33 @@ def main_cli():
 
     args = parser.parse_args()
 
-    json_keys = ["boesch", "mqtt"]
-    
-    print(f"Initializing for Home ID: {args.home_id}...")
     try:
+        json_keys = ["boesch", "mqtt"]
         wp = BoeschWP(args.home_id, json_keys)
-    except Exception as e:
-        print(f"Error initializing BoeschWP: {e}")
-        print("Please ensure your domuxConfig Lambda is working and accessible, and the home_id is correct.")
-        return
-
-    current_session = requests.Session()
-    print("Authenticating...")
-    try:
-        wp.access_token = wp.perform_pkce_login_and_get_token(current_session)
-        if not wp.access_token:
-            print("Authentication failed. Exiting.")
-            return
+        print("Authenticating...")
+        wp.login()
         print("Authentication successful.")
-    except Exception as e:
-        print(f"An error occurred during authentication: {e}")
-        return
 
-    try:
         if args.command == "monitor":
-            wp.monitor(current_session, wp.access_token)
+            wp.monitor()
         elif args.command == "status":
-            wp.status(current_session, wp.access_token)
+            wp.status()
         elif args.command == "datapoint":
-            datapoint_name_upper = args.name.upper()
+            dp_name = args.name.upper()
             if args.action == "get":
-                value = wp.get_datapoint(current_session, wp.access_token, datapoint_name_upper)
-                unit = wp.config.get("setDatapoints", {}).get(datapoint_name_upper, {}).get("unit", "")
-                print(f"Datapoint '{datapoint_name_upper}' value: {value} {unit}")
+                value = wp.get_datapoint(dp_name)
+                unit = wp.config.get("setDatapoints", {}).get(dp_name, {}).get("unit", "")
+                print(f"Datapoint '{dp_name}' value: {value} {unit}")
             elif args.action == "set":
                 if args.value is None:
                     print("Error: Value is required for 'set' action.")
-                    dp_parser.print_help()
                     return
-                print(f"Attempting to set datapoint '{datapoint_name_upper}' to '{args.value}'...")
-                success = wp.set_datapoint(current_session, wp.access_token, datapoint_name_upper, args.value)
-                if success:
-                    print(f"Successfully set datapoint '{datapoint_name_upper}' to '{args.value}'.")
-    except ValueError as ve:
-        print(f"Configuration or Value Error: {ve}")
-    except requests.exceptions.HTTPError as he:
-        print(f"HTTP Error: {he} - {he.response.text if he.response else 'No response content'}")
+                print(f"Attempting to set '{dp_name}' to '{args.value}'...")
+                if wp.set_datapoint(dp_name, args.value):
+                    print(f"Successfully set '{dp_name}' to '{args.value}'.")
+
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main_cli()
-
-    
