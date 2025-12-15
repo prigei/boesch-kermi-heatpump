@@ -27,7 +27,7 @@
             "ac0a8989-e55d-4c8d-9550-071cfc57c01c": {"description": "Leistungsaufnahme Gesamt", "device": "LAG", "type": "eny", "unit": "kWh", "factor": 1 },
             "e9343511-e130-4fa0-81a8-764a69890f31": {"description": "Isttemperatur HK", "device": "ITHK", "type": "temp", "unit": "C", "factor": 1 },
             "34760a09-8f79-424f-a1b0-5f1a9339d864": {"description": "COP", "device": "COP", "type": "ratio", "unit": "ratio", "factor": 1 },
-            "7605e769-5bcf-4e37-97e4-e1cded35dc54": {"description": "Heizleistung Heizung", "device": "HLHF2", "type": "eny", "unit": "kW", "factor": 1 }
+            "7605e769-5bcf-4e37-97e4-e1cded35dc54": {"description": "Heizleistung Heizung Korrekturfaktor", "device": "HLHF2", "type": "eny", "unit": "kW", "factor": 1 }
         },
         "statusDatapoints": {
             "83a34595-924a-421e-b9c1-44c2a49f97ad": {"description": "Trinkwassertemperatur", "device": "TWT", "type": "temp", "unit": "C", "factor": 1 },
